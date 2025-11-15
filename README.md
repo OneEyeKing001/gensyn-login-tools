@@ -307,3 +307,4 @@ git checkout <old-commit> -- gensyn-login-bootstrap.js
 ```
 
 That makes it easy to compare or restore older working versions when a new change breaks something.
+Initialize login tool framework
