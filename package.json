@@ -1,0 +1,15 @@
+{
+  "name": "gensyn-login-tools",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Chrome-profile-based Gensyn Delphi login bootstrap and in-page automation helper.",
+  "main": "gensyn-login-bootstrap.js",
+  "scripts": {
+    "start": "node gensyn-login-bootstrap.js",
+    "start:run-main": "node gensyn-login-bootstrap.js --run-main",
+    "check": "node --check gensyn-login-bootstrap.js"
+  },
+  "dependencies": {
+    "playwright-core": "^1.52.0"
+  }
+}
