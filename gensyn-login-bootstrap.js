@@ -14,6 +14,15 @@ const OTP_SUBJECT_RE = /(\d{6}) is your login code for Gensyn Testnet/i;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+function uniqueByDirName(profiles) {
+  const seen = new Set();
+  return profiles.filter((profile) => {
+    if (seen.has(profile.dirName)) return false;
+    seen.add(profile.dirName);
+    return true;
+  });
+}
+
 function createPrompt() {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   return {
@@ -70,7 +79,53 @@ function getChromeProfiles() {
   return profiles;
 }
 
-async function promptForChromeProfile() {
+function parseProfileSelection(input, profiles) {
+  const selected = [];
+  const chunks = input
+    .split(',')
+    .map((part) => part.trim())
+    .filter(Boolean);
+
+  for (const chunk of chunks) {
+    const rangeMatch = chunk.match(/^(\d+)\s*-\s*(\d+)$/);
+    if (rangeMatch) {
+      let start = Number.parseInt(rangeMatch[1], 10);
+      let end = Number.parseInt(rangeMatch[2], 10);
+      if (start > end) [start, end] = [end, start];
+      for (let i = start; i <= end; i++) {
+        if (i < 1 || i > profiles.length) {
+          throw new Error(`Profile number out of range: ${i}`);
+        }
+        selected.push(profiles[i - 1]);
+      }
+      continue;
+    }
+
+    const byNumber = Number.parseInt(chunk, 10);
+    if (Number.isInteger(byNumber) && String(byNumber) === chunk) {
+      if (byNumber < 1 || byNumber > profiles.length) {
+        throw new Error(`Profile number out of range: ${byNumber}`);
+      }
+      selected.push(profiles[byNumber - 1]);
+      continue;
+    }
+
+    const normalized = chunk.toLowerCase();
+    const matched = profiles.find((profile) =>
+      [profile.displayName, profile.dirName, profile.userName]
+        .filter(Boolean)
+        .some((value) => value.toLowerCase() === normalized)
+    );
+    if (!matched) {
+      throw new Error(`Profile not found: ${chunk}`);
+    }
+    selected.push(matched);
+  }
+
+  return uniqueByDirName(selected);
+}
+
+async function promptForChromeProfiles() {
   const profiles = getChromeProfiles();
   if (!profiles.length) throw new Error(`No Chrome profiles found in ${CHROME_USER_DATA_DIR}`);
 
@@ -84,24 +139,33 @@ async function promptForChromeProfile() {
 
   const prompt = createPrompt();
   try {
+    let count;
     while (true) {
-      const answer = await prompt.ask('\nType Chrome profile number or name: ');
+      const countAnswer = await prompt.ask('\nHow many profiles do you want to run? ');
+      const parsed = Number.parseInt(countAnswer, 10);
+      if (Number.isInteger(parsed) && parsed >= 1 && parsed <= profiles.length) {
+        count = parsed;
+        break;
+      }
+      console.log(`Enter a number between 1 and ${profiles.length}.`);
+    }
+
+    while (true) {
+      const answer = await prompt.ask(
+        'Enter profile numbers/names (examples: 1,2,3 or 1-5,7-9): '
+      );
       if (!answer) continue;
 
-      const byNumber = Number.parseInt(answer, 10);
-      if (Number.isInteger(byNumber) && byNumber >= 1 && byNumber <= profiles.length) {
-        return profiles[byNumber - 1];
+      try {
+        const selected = parseProfileSelection(answer, profiles);
+        if (selected.length !== count) {
+          console.log(`You selected ${selected.length} profile(s), but asked for ${count}. Try again.`);
+          continue;
+        }
+        return selected;
+      } catch (err) {
+        console.log(err.message);
       }
-
-      const normalized = answer.toLowerCase();
-      const matched = profiles.find((profile) =>
-        [profile.displayName, profile.dirName, profile.userName]
-          .filter(Boolean)
-          .some((value) => value.toLowerCase() === normalized)
-      );
-      if (matched) return matched;
-
-      console.log('Profile not found. Enter the exact name shown above, or a number from the list.');
     }
   } finally {
     prompt.close();
@@ -206,11 +270,8 @@ async function runExistingAutomation(delphiPage) {
   await delphiPage.evaluate(code);
 }
 
-async function main() {
-  const shouldRunMain = process.argv.includes('--run-main');
-  const selectedProfile = await promptForChromeProfile();
-
-  console.log('\nLaunching Chrome with profile:');
+async function runWorkflowForProfile(selectedProfile, shouldRunMain, index, total) {
+  console.log(`\n[${index}/${total}] Launching Chrome with profile:`);
   console.log(`  Name: ${selectedProfile.displayName}`);
   if (selectedProfile.userName) console.log(`  Account: ${selectedProfile.userName}`);
   console.log(`  Directory: ${selectedProfile.dirName}`);
@@ -231,27 +292,58 @@ async function main() {
 
   try {
     const email = await extractLoggedInGmailAddress(gmailPage);
-    console.log('Using Gmail account:', email);
+    console.log(`[${index}/${total}] Using Gmail account:`, email);
 
     await requestOtp(delphiPage, email);
-    console.log('Requested OTP from Delphi.');
+    console.log(`[${index}/${total}] Requested OTP from Delphi.`);
 
     const otp = await getNewestOtpFromInbox(gmailPage);
-    console.log('OTP found:', otp);
+    console.log(`[${index}/${total}] OTP found:`, otp);
 
     await submitOtp(delphiPage, otp);
-    console.log('Logged into Delphi successfully.');
+    console.log(`[${index}/${total}] Logged into Delphi successfully.`);
 
     if (shouldRunMain) {
-      console.log('Running existing Delphi automation script...');
+      console.log(`[${index}/${total}] Running existing Delphi automation script...`);
       await runExistingAutomation(delphiPage);
     } else {
-      console.log('Login bootstrap complete. Delphi tab is ready.');
+      console.log(`[${index}/${total}] Login bootstrap complete. Delphi tab is ready.`);
     }
+
+    return { profile: selectedProfile, ok: true };
   } catch (err) {
-    console.error('Bootstrap failed:', err.message);
+    console.error(`[${index}/${total}] Bootstrap failed for ${selectedProfile.displayName}:`, err.message);
     console.error('Chrome profile kept open for inspection.');
-    return;
+    return { profile: selectedProfile, ok: false, error: err.message };
+  }
+}
+
+async function main() {
+  const shouldRunMain = process.argv.includes('--run-main');
+  const selectedProfiles = await promptForChromeProfiles();
+
+  console.log('\nSelected profiles:');
+  selectedProfiles.forEach((profile, idx) => {
+    console.log(`  ${idx + 1}. ${profile.displayName} (${profile.dirName})`);
+  });
+
+  console.log(
+    '\nNote: with real Chrome profiles, running many persistent sessions truly in parallel can hit Chrome profile locks. This script will process the selected profiles in batch order for reliability.'
+  );
+
+  const results = [];
+  for (let i = 0; i < selectedProfiles.length; i++) {
+    const result = await runWorkflowForProfile(selectedProfiles[i], shouldRunMain, i + 1, selectedProfiles.length);
+    results.push(result);
+  }
+
+  console.log('\nBatch summary:');
+  for (const result of results) {
+    if (result.ok) {
+      console.log(`  ✅ ${result.profile.displayName} (${result.profile.dirName})`);
+    } else {
+      console.log(`  ❌ ${result.profile.displayName} (${result.profile.dirName}) — ${result.error}`);
+    }
   }
 }
 

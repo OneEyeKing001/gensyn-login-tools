@@ -5,10 +5,12 @@ Small helper repo for logging into **Gensyn Delphi** with your **existing Google
 ## What is included
 
 - `gensyn-login-bootstrap.js`
-  - launches Chrome with a profile you choose
-  - asks for your Chrome profile by **number or name**
+  - launches Chrome with one or more profiles you choose
+  - asks how many profiles you want to run
+  - accepts profile selection by **number, name, comma list, or ranges**
+  - examples: `1,2,3,6` or `1-5,7-9`
   - opens Delphi + Gmail
-  - reads the logged-in Gmail address from that profile
+  - reads the logged-in Gmail address from each selected profile
   - requests the OTP on Delphi
   - finds the newest Gensyn OTP mail in Gmail
   - submits the OTP into Delphi
@@ -90,23 +92,32 @@ Then it prints a numbered list like:
 Available Chrome profiles:
   1. Person 1 — mymail@gmail.com — Default
   2. Work — work@gmail.com — Profile 1
+  3. Testing — test@gmail.com — Profile 2
 ```
 
-You can type either:
+Next it asks how many profiles you want to run.
 
-- the **number** (`1`, `2`, `3`)
-- the **profile display name**
-- the **Chrome directory name** (`Default`, `Profile 1`, etc.)
+After that, you can enter:
+
+- single numbers: `1`
+- comma-separated lists: `1,2,3`
+- ranges: `1-5`
+- mixed ranges/lists: `1-3,6,8-10`
+- exact profile names / Chrome directory names if needed
+
+The number of selected profiles must match the count you entered.
 
 ## Important note about Chrome profiles
 
 Chrome profiles are often **locked** when already open in a normal Chrome window.
 
+Also: because this script uses your **real Chrome profiles**, opening many persistent automated sessions truly in parallel can be unreliable. For safety, the script now lets you select multiple profiles, but it processes them in a **batch, one after another**, while keeping each profile window available for inspection.
+
 If the script fails to launch or attach cleanly:
 
 1. close all normal Chrome windows first
 2. run the script again
-3. choose the desired profile
+3. choose the desired profile(s)
 
 ## Default behavior
 
