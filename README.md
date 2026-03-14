@@ -112,6 +112,51 @@ or
 npm run start:run-main
 ```
 
+## Launch strategy
+
+The bootstrap script now uses two different launch strategies depending on environment:
+
+### Windows / WSL: real Chrome + CDP attach
+
+On Windows and WSL, the script:
+
+1. launches your real Chrome executable directly
+2. points it at your real Chrome user-data directory
+3. selects the requested profile via `--profile-directory=...`
+4. enables remote debugging on a local port
+5. attaches Playwright to that live Chrome instance over CDP
+
+This is intentional. It avoids the newer Chrome / Playwright failure mode where `launchPersistentContext(...)` against the main Windows profile root can fail before navigation even begins.
+
+### Linux: Playwright persistent context
+
+On Linux, the script still uses Playwright persistent context mode directly against your Linux Chrome profile root.
+
+## Environment variables / overrides
+
+You can override the auto-detected settings with environment variables.
+
+### Supported variables
+
+- `CHROME_PATH`
+  - override the Chrome executable path
+- `CHROME_USER_DATA_DIR`
+  - override the Chrome user-data root
+- `WINDOWS_USER`
+  - mainly useful in WSL if the guessed Windows username is wrong
+- `CHROME_DEBUG_PORT`
+  - override the CDP port used in Windows / WSL mode
+
+### Example: WSL explicit override
+
+```bash
+export WINDOWS_USER=user
+export CHROME_PATH="/mnt/c/Program Files/Google/Chrome/Application/chrome.exe"
+export CHROME_USER_DATA_DIR="/mnt/c/Users/user/AppData/Local/Google/Chrome/User Data"
+export CHROME_DEBUG_PORT=9222
+node gensyn-login-bootstrap.js
+```
+
 ## How profile selection works
 
 On start, the script reads your normal Chrome profiles from your detected Chrome user-data root.
@@ -149,6 +194,8 @@ It includes:
 
 - resolved Chrome mode and paths
 - launch steps
+- selected profile and profile directory
+- CDP attach details in Windows / WSL mode
 - navigation steps
 - page console output
 - request failures
@@ -156,6 +203,15 @@ It includes:
 - OTP polling status
 
 If the run gets stuck, check `gensyn-debug.log` first.
+
+A useful first-pass check is:
+
+- did it resolve the correct Chrome mode?
+- did it resolve the correct Chrome executable path?
+- did it resolve the correct user-data directory?
+- did it pick the expected profile directory?
+- did Gmail navigation start?
+- did Delphi navigation start?
 
 ## Important note about Chrome profiles
 
@@ -216,6 +272,24 @@ or explicitly set `CHROME_USER_DATA_DIR`.
 
 ### Existing script not found
 This only matters when using `--run-main`. Make sure `gensynautorun.js` is in the same folder as `gensyn-login-bootstrap.js`.
+
+### Chrome launches but still uses the wrong profile
+Check the debug log and verify all of these:
+
+- resolved mode is what you expected (`windows-cdp` vs `linux-persistent`)
+- `CHROME_USER_DATA_DIR` points to the real Chrome **User Data** root, not a random copied folder
+- the chosen profile name matches the one you actually use in Chrome
+- no other regular Chrome windows were already open before the run
+
+### Chrome opens but Gmail / Delphi never progresses
+Check `gensyn-debug.log` for the last completed step.
+
+Typical breakpoints are:
+
+- attach / launch failed before first page navigation
+- Gmail opened but no signed-in address was detected
+- Delphi opened but the expected login button or email field changed
+- OTP never appeared in Gmail in the expected time window
 
 ## Security / caution
 
