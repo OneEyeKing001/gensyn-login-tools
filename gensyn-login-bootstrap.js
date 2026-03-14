@@ -3,16 +3,88 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const readline = require('readline');
+const http = require('http');
+const net = require('net');
+const { spawn, execSync } = require('child_process');
 
-const CHROME_PATH = '/usr/bin/google-chrome';
-const CHROME_USER_DATA_DIR = path.join(os.homedir(), '.config', 'google-chrome');
-const DELPHI_URL = 'https://delphi.gensyn.ai/';
-const GMAIL_URL = 'https://mail.google.com/mail/u/0/#inbox';
 const SCRIPT_DIR = __dirname;
 const EXISTING_SCRIPT = path.join(SCRIPT_DIR, 'gensynautorun.js');
+const LOG_FILE = path.join(SCRIPT_DIR, 'gensyn-debug.log');
+const DELPHI_URL = 'https://delphi.gensyn.ai/';
+const GMAIL_URL = 'https://mail.google.com/mail/#inbox';
 const OTP_SUBJECT_RE = /(\d{6}) is your login code for Gensyn Testnet/i;
+const DEFAULT_WINDOWS_DEBUG_HOST = '127.0.0.1';
+const DEFAULT_WINDOWS_DEBUG_PORT = 9222;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function log(...args) {
+  const line = `[${new Date().toISOString()}] ${args
+    .map((arg) => {
+      if (arg instanceof Error) return arg.stack || arg.message;
+      if (typeof arg === 'string') return arg;
+      try {
+        return JSON.stringify(arg);
+      } catch {
+        return String(arg);
+      }
+    })
+    .join(' ')}`;
+  console.log(line);
+  try {
+    fs.appendFileSync(LOG_FILE, `${line}\n`);
+  } catch {}
+}
+
+function clearLogFile() {
+  try {
+    fs.writeFileSync(LOG_FILE, '');
+  } catch {}
+}
+
+function isWsl() {
+  if (process.platform !== 'linux') return false;
+  if (process.env.WSL_DISTRO_NAME) return true;
+  try {
+    return fs.readFileSync('/proc/version', 'utf8').toLowerCase().includes('microsoft');
+  } catch {
+    return false;
+  }
+}
+
+function resolveChromeConfig() {
+  const envChromePath = process.env.CHROME_PATH;
+  const envUserDataDir = process.env.CHROME_USER_DATA_DIR;
+
+  if (process.platform === 'win32') {
+    const localAppData = process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local');
+    return {
+      mode: 'windows-cdp',
+      chromePath:
+        envChromePath ||
+        path.join(process.env['PROGRAMFILES'] || 'C:\\Program Files', 'Google', 'Chrome', 'Application', 'chrome.exe'),
+      userDataDir: envUserDataDir || path.join(localAppData, 'Google', 'Chrome', 'User Data'),
+    };
+  }
+
+  if (isWsl()) {
+    const winUser = process.env.WINDOWS_USER || process.env.WIN_USERNAME || process.env.USERNAME || 'user';
+    return {
+      mode: 'windows-cdp',
+      chromePath: envChromePath || '/mnt/c/Program Files/Google/Chrome/Application/chrome.exe',
+      userDataDir:
+        envUserDataDir || `/mnt/c/Users/${winUser}/AppData/Local/Google/Chrome/User Data`,
+    };
+  }
+
+  return {
+    mode: 'linux-persistent',
+    chromePath: envChromePath || '/usr/bin/google-chrome',
+    userDataDir: envUserDataDir || path.join(os.homedir(), '.config', 'google-chrome'),
+  };
+}
+
+const CHROME = resolveChromeConfig();
 
 function uniqueByDirName(profiles) {
   const seen = new Set();
@@ -35,28 +107,46 @@ function createPrompt() {
   };
 }
 
+function killChromeWindowsBestEffort() {
+  if (CHROME.mode !== 'windows-cdp') return;
+  const commands = process.platform === 'win32'
+    ? ['taskkill /F /IM chrome.exe /T']
+    : [
+        'cmd.exe /c taskkill /F /IM chrome.exe /T',
+        'powershell.exe -NoProfile -Command "Stop-Process -Name chrome -Force -ErrorAction SilentlyContinue"',
+      ];
+
+  for (const command of commands) {
+    try {
+      execSync(command, { stdio: 'ignore' });
+      log('Issued Chrome kill command:', command);
+      return;
+    } catch {}
+  }
+}
+
 function readChromeLocalState() {
-  const localStatePath = path.join(CHROME_USER_DATA_DIR, 'Local State');
+  const localStatePath = path.join(CHROME.userDataDir, 'Local State');
   if (!fs.existsSync(localStatePath)) return {};
 
   try {
     return JSON.parse(fs.readFileSync(localStatePath, 'utf8'));
   } catch (err) {
-    console.warn('Could not parse Chrome Local State:', err.message);
+    log('Could not parse Chrome Local State:', err.message);
     return {};
   }
 }
 
 function getChromeProfiles() {
-  if (!fs.existsSync(CHROME_USER_DATA_DIR)) {
-    throw new Error(`Chrome user data directory not found: ${CHROME_USER_DATA_DIR}`);
+  if (!fs.existsSync(CHROME.userDataDir)) {
+    throw new Error(`Chrome user data directory not found: ${CHROME.userDataDir}`);
   }
 
   const localState = readChromeLocalState();
   const infoCache = localState?.profile?.info_cache || {};
 
   const dirs = fs
-    .readdirSync(CHROME_USER_DATA_DIR, { withFileTypes: true })
+    .readdirSync(CHROME.userDataDir, { withFileTypes: true })
     .filter((entry) => entry.isDirectory())
     .map((entry) => entry.name)
     .filter((name) => name === 'Default' || /^Profile \d+$/.test(name));
@@ -93,9 +183,7 @@ function parseProfileSelection(input, profiles) {
       let end = Number.parseInt(rangeMatch[2], 10);
       if (start > end) [start, end] = [end, start];
       for (let i = start; i <= end; i++) {
-        if (i < 1 || i > profiles.length) {
-          throw new Error(`Profile number out of range: ${i}`);
-        }
+        if (i < 1 || i > profiles.length) throw new Error(`Profile number out of range: ${i}`);
         selected.push(profiles[i - 1]);
       }
       continue;
@@ -116,9 +204,7 @@ function parseProfileSelection(input, profiles) {
         .filter(Boolean)
         .some((value) => value.toLowerCase() === normalized)
     );
-    if (!matched) {
-      throw new Error(`Profile not found: ${chunk}`);
-    }
+    if (!matched) throw new Error(`Profile not found: ${chunk}`);
     selected.push(matched);
   }
 
@@ -127,7 +213,7 @@ function parseProfileSelection(input, profiles) {
 
 async function promptForChromeProfiles() {
   const profiles = getChromeProfiles();
-  if (!profiles.length) throw new Error(`No Chrome profiles found in ${CHROME_USER_DATA_DIR}`);
+  if (!profiles.length) throw new Error(`No Chrome profiles found in ${CHROME.userDataDir}`);
 
   console.log('\nAvailable Chrome profiles:');
   profiles.forEach((profile, index) => {
@@ -151,11 +237,8 @@ async function promptForChromeProfiles() {
     }
 
     while (true) {
-      const answer = await prompt.ask(
-        'Enter profile numbers/names (examples: 1,2,3 or 1-5,7-9): '
-      );
+      const answer = await prompt.ask('Enter profile numbers/names (examples: 1,2,3 or 1-5,7-9): ');
       if (!answer) continue;
-
       try {
         const selected = parseProfileSelection(answer, profiles);
         if (selected.length !== count) {
@@ -172,16 +255,34 @@ async function promptForChromeProfiles() {
   }
 }
 
-async function extractLoggedInGmailAddress(gmailPage) {
-  await gmailPage.goto(GMAIL_URL, { waitUntil: 'domcontentloaded' });
-  await gmailPage.waitForLoadState('networkidle').catch(() => {});
+function attachPageLogging(page, label) {
+  page.on('console', (msg) => log(`[${label}] console.${msg.type()}:`, msg.text()));
+  page.on('pageerror', (err) => log(`[${label}] pageerror:`, err));
+  page.on('requestfailed', (req) => {
+    const failure = req.failure();
+    log(`[${label}] requestfailed:`, req.url(), failure?.errorText || 'unknown');
+  });
+}
 
-  const direct = gmailPage.locator('a[aria-label*="Google Account:"] img, button[aria-label*="Google Account:"]').first();
-  if (await direct.count()) {
+function attachContextLogging(context, prefix) {
+  for (const page of context.pages()) attachPageLogging(page, `${prefix}:page`);
+  context.on('page', (page) => {
+    log(`[${prefix}] new page:`, page.url() || 'about:blank');
+    attachPageLogging(page, `${prefix}:page`);
+  });
+}
+
+async function extractLoggedInGmailAddress(gmailPage) {
+  log('Navigating Gmail tab to:', GMAIL_URL);
+  await gmailPage.goto(GMAIL_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await gmailPage.waitForTimeout(6000);
+
+  const accountAnchor = gmailPage.locator('a[aria-label*="@"], [aria-label*="Google Account"], img[alt*="Google Account"]').first();
+  if (await accountAnchor.count()) {
     const label =
-      (await direct.getAttribute('aria-label')) ||
-      (await direct.evaluate((el) => el.closest('button,a')?.getAttribute('aria-label') || ''));
-    const match = label.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
+      (await accountAnchor.getAttribute('aria-label').catch(() => null)) ||
+      (await accountAnchor.evaluate((el) => el.closest('a,button')?.getAttribute('aria-label') || '').catch(() => ''));
+    const match = (label || '').match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
     if (match) return match[0];
   }
 
@@ -189,12 +290,13 @@ async function extractLoggedInGmailAddress(gmailPage) {
   const bodyMatch = bodyText.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
   if (bodyMatch) return bodyMatch[0];
 
-  throw new Error('Could not determine signed-in Gmail address. Open Gmail in the selected Chrome profile first.');
+  throw new Error('Could not determine signed-in Gmail address. Gmail may not be logged in in this Chrome profile.');
 }
 
 async function openDelphiLogin(delphiPage) {
-  await delphiPage.goto(DELPHI_URL, { waitUntil: 'domcontentloaded' });
-  await delphiPage.waitForLoadState('networkidle').catch(() => {});
+  log('Navigating Delphi tab to:', DELPHI_URL);
+  await delphiPage.goto(DELPHI_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await delphiPage.waitForTimeout(5000);
 
   const connectBtn = delphiPage.getByRole('button', { name: /connect wallet/i }).first();
   await connectBtn.waitFor({ state: 'visible', timeout: 30000 });
@@ -215,9 +317,10 @@ async function requestOtp(delphiPage, email) {
   await delphiPage.getByText(/enter verification code/i).waitFor({ state: 'visible', timeout: 30000 });
 }
 
-async function getNewestOtpFromInbox(gmailPage, timeoutMs = 120000) {
-  await gmailPage.goto(GMAIL_URL, { waitUntil: 'domcontentloaded' });
-  await gmailPage.waitForLoadState('networkidle').catch(() => {});
+async function getNewestOtpFromInbox(gmailPage, timeoutMs = 180000) {
+  log('Refreshing Gmail inbox for OTP');
+  await gmailPage.goto(GMAIL_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await gmailPage.waitForTimeout(6000);
 
   const refreshButton = gmailPage.getByRole('button', { name: /refresh/i }).first();
   const inboxTab = gmailPage.getByRole('link', { name: /inbox/i }).first();
@@ -229,18 +332,21 @@ async function getNewestOtpFromInbox(gmailPage, timeoutMs = 120000) {
       if (await refreshButton.count()) await refreshButton.click().catch(() => {});
     } catch {}
 
-    await sleep(2500);
+    await sleep(3000);
+
+    const rows = gmailPage.locator('tr, [role="row"]');
+    const rowCount = await rows.count().catch(() => 0);
+    for (let i = 0; i < Math.min(rowCount, 12); i++) {
+      const rowText = await rows.nth(i).innerText().catch(() => '');
+      const match = rowText.match(OTP_SUBJECT_RE);
+      if (match) return match[1];
+    }
 
     const bodyText = await gmailPage.locator('body').innerText().catch(() => '');
     const directMatch = bodyText.match(/\b(\d{6})\b is your login code for Gensyn Testnet/i);
     if (directMatch) return directMatch[1];
 
-    const subjectRow = gmailPage.locator('tr, [role="row"]').filter({ hasText: /is your login code for Gensyn Testnet/i }).first();
-    if (await subjectRow.count()) {
-      const rowText = await subjectRow.innerText().catch(() => '');
-      const rowMatch = rowText.match(OTP_SUBJECT_RE);
-      if (rowMatch) return rowMatch[1];
-    }
+    log('OTP not found yet, continuing to poll...');
   }
 
   throw new Error('OTP email did not appear in Gmail in time.');
@@ -250,19 +356,21 @@ async function submitOtp(delphiPage, otp) {
   const inputs = delphiPage.locator('input[aria-label*="One time password input"]');
   const count = await inputs.count();
   if (count >= 6) {
-    for (let i = 0; i < 6; i++) {
-      await inputs.nth(i).fill(otp[i]);
-    }
+    for (let i = 0; i < 6; i++) await inputs.nth(i).fill(otp[i]);
   } else {
-    await delphiPage.keyboard.type(otp, { delay: 50 });
+    const firstInput = delphiPage.locator('input').first();
+    if (await firstInput.count()) await firstInput.fill(otp);
+    else await delphiPage.keyboard.type(otp, { delay: 50 });
   }
 
-  await delphiPage.locator('text=/0x[a-fA-F0-9]{4}\.\.\.[a-fA-F0-9]{4}/').waitFor({ state: 'visible', timeout: 30000 });
+  await delphiPage
+    .locator('text=/0x[a-fA-F0-9]{4}\.\.\.[a-fA-F0-9]{4}/')
+    .waitFor({ state: 'visible', timeout: 30000 });
 }
 
 async function runExistingAutomation(delphiPage) {
   if (!fs.existsSync(EXISTING_SCRIPT)) {
-    console.log('Existing script not found, skipping handoff:', EXISTING_SCRIPT);
+    log('Existing script not found, skipping handoff:', EXISTING_SCRIPT);
     return;
   }
 
@@ -270,66 +378,188 @@ async function runExistingAutomation(delphiPage) {
   await delphiPage.evaluate(code);
 }
 
-async function runWorkflowForProfile(selectedProfile, shouldRunMain, index, total) {
-  console.log(`\n[${index}/${total}] Launching Chrome with profile:`);
-  console.log(`  Name: ${selectedProfile.displayName}`);
-  if (selectedProfile.userName) console.log(`  Account: ${selectedProfile.userName}`);
-  console.log(`  Directory: ${selectedProfile.dirName}`);
-  console.log(`  User data dir: ${CHROME_USER_DATA_DIR}`);
-
-  const context = await chromium.launchPersistentContext(CHROME_USER_DATA_DIR, {
-    headless: false,
-    executablePath: CHROME_PATH,
-    args: ['--start-maximized', `--profile-directory=${selectedProfile.dirName}`],
-    viewport: null,
+function waitForPort(host, port, timeoutMs) {
+  const started = Date.now();
+  return new Promise((resolve, reject) => {
+    const attempt = () => {
+      const socket = net.createConnection({ host, port });
+      socket.once('connect', () => {
+        socket.destroy();
+        resolve();
+      });
+      socket.once('error', () => {
+        socket.destroy();
+        if (Date.now() - started >= timeoutMs) {
+          reject(new Error(`Timed out waiting for ${host}:${port}`));
+        } else {
+          setTimeout(attempt, 500);
+        }
+      });
+    };
+    attempt();
   });
+}
 
-  let gmailPage = context.pages().find((p) => p.url().includes('mail.google.com'));
-  if (!gmailPage) gmailPage = await context.newPage();
+function httpGetJson(url) {
+  return new Promise((resolve, reject) => {
+    http
+      .get(url, (res) => {
+        let raw = '';
+        res.setEncoding('utf8');
+        res.on('data', (chunk) => (raw += chunk));
+        res.on('end', () => {
+          try {
+            resolve(JSON.parse(raw));
+          } catch (err) {
+            reject(err);
+          }
+        });
+      })
+      .on('error', reject);
+  });
+}
 
-  let delphiPage = context.pages().find((p) => p.url().includes('delphi.gensyn.ai'));
-  if (!delphiPage) delphiPage = await context.newPage();
+async function launchWindowsChromeAndConnect(selectedProfile) {
+  const host = DEFAULT_WINDOWS_DEBUG_HOST;
+  const port = Number(process.env.CHROME_DEBUG_PORT || DEFAULT_WINDOWS_DEBUG_PORT);
 
+  killChromeWindowsBestEffort();
+  await sleep(1500);
+
+  const chromeArgs = [
+    `--remote-debugging-port=${port}`,
+    `--user-data-dir=${CHROME.userDataDir}`,
+    `--profile-directory=${selectedProfile.dirName}`,
+    '--start-maximized',
+    '--no-first-run',
+    '--no-default-browser-check',
+    '--disable-blink-features=AutomationControlled',
+  ];
+
+  log('Launching real Chrome profile via CDP attach');
+  log('Chrome path:', CHROME.chromePath);
+  log('Chrome user data dir:', CHROME.userDataDir);
+  log('Chrome profile directory:', selectedProfile.dirName);
+  log('Chrome debug endpoint:', `${host}:${port}`);
+
+  const child = spawn(CHROME.chromePath, chromeArgs, {
+    detached: true,
+    stdio: 'ignore',
+    windowsHide: false,
+  });
+  child.unref();
+
+  await waitForPort(host, port, 30000);
+  const versionInfo = await httpGetJson(`http://${host}:${port}/json/version`);
+  log('DevTools browser endpoint:', versionInfo.webSocketDebuggerUrl || 'missing');
+
+  const browser = await chromium.connectOverCDP(`http://${host}:${port}`);
+  const context = browser.contexts()[0] || (await browser.newContext());
+  attachContextLogging(context, `profile:${selectedProfile.dirName}`);
+  return { browser, context };
+}
+
+async function launchLinuxPersistentContext(selectedProfile) {
+  log('Launching Chrome via Playwright persistent context');
+  log('Chrome path:', CHROME.chromePath);
+  log('Chrome user data dir:', CHROME.userDataDir);
+  log('Chrome profile directory:', selectedProfile.dirName);
+
+  const context = await chromium.launchPersistentContext(CHROME.userDataDir, {
+    headless: false,
+    executablePath: CHROME.chromePath,
+    ignoreDefaultArgs: ['--disable-extensions'],
+    args: [
+      '--start-maximized',
+      '--no-first-run',
+      '--no-default-browser-check',
+      '--disable-dev-shm-usage',
+      '--disable-blink-features=AutomationControlled',
+      `--profile-directory=${selectedProfile.dirName}`,
+    ],
+    viewport: null,
+    timeout: 120000,
+  });
+  attachContextLogging(context, `profile:${selectedProfile.dirName}`);
+  return { browser: null, context };
+}
+
+async function openOrReuseTabs(context) {
+  let pages = context.pages();
+  if (!pages.length) pages = [await context.newPage()];
+
+  const gmailPage = pages[0];
+  await gmailPage.bringToFront().catch(() => {});
+
+  const delphiPage = await context.newPage();
+  return { gmailPage, delphiPage };
+}
+
+async function runWorkflowForProfile(selectedProfile, shouldRunMain, index, total) {
+  log(`\n[${index}/${total}] Launching workflow for profile`);
+  log('Name:', selectedProfile.displayName);
+  if (selectedProfile.userName) log('Account:', selectedProfile.userName);
+  log('Directory:', selectedProfile.dirName);
+  log('Mode:', CHROME.mode);
+
+  let browser;
+  let context;
   try {
+    ({ browser, context } = CHROME.mode === 'windows-cdp'
+      ? await launchWindowsChromeAndConnect(selectedProfile)
+      : await launchLinuxPersistentContext(selectedProfile));
+
+    const { gmailPage, delphiPage } = await openOrReuseTabs(context);
+
     const email = await extractLoggedInGmailAddress(gmailPage);
-    console.log(`[${index}/${total}] Using Gmail account:`, email);
+    log(`[${index}/${total}] Using Gmail account:`, email);
 
     await requestOtp(delphiPage, email);
-    console.log(`[${index}/${total}] Requested OTP from Delphi.`);
+    log(`[${index}/${total}] Requested OTP from Delphi.`);
 
     const otp = await getNewestOtpFromInbox(gmailPage);
-    console.log(`[${index}/${total}] OTP found:`, otp);
+    log(`[${index}/${total}] OTP found:`, otp);
 
     await submitOtp(delphiPage, otp);
-    console.log(`[${index}/${total}] Logged into Delphi successfully.`);
+    log(`[${index}/${total}] Logged into Delphi successfully.`);
 
     if (shouldRunMain) {
-      console.log(`[${index}/${total}] Running existing Delphi automation script...`);
+      log(`[${index}/${total}] Running existing Delphi automation script...`);
       await runExistingAutomation(delphiPage);
     } else {
-      console.log(`[${index}/${total}] Login bootstrap complete. Delphi tab is ready.`);
+      log(`[${index}/${total}] Login bootstrap complete. Delphi tab is ready.`);
     }
 
     return { profile: selectedProfile, ok: true };
   } catch (err) {
-    console.error(`[${index}/${total}] Bootstrap failed for ${selectedProfile.displayName}:`, err.message);
-    console.error('Chrome profile kept open for inspection.');
+    log(`[${index}/${total}] Bootstrap failed for ${selectedProfile.displayName}:`, err);
+    log('Debug log saved to:', LOG_FILE);
     return { profile: selectedProfile, ok: false, error: err.message };
+  } finally {
+    if (browser && CHROME.mode === 'windows-cdp') {
+      await browser.close().catch(() => {});
+    }
   }
 }
 
 async function main() {
+  clearLogFile();
+  log('=== SCRIPT STARTED ===');
+  log('Resolved Chrome config:', CHROME);
+  log('Debug log file:', LOG_FILE);
+
   const shouldRunMain = process.argv.includes('--run-main');
   const selectedProfiles = await promptForChromeProfiles();
+
+  log('Selected profiles:', selectedProfiles.map((profile) => `${profile.displayName} (${profile.dirName})`).join(', '));
 
   console.log('\nSelected profiles:');
   selectedProfiles.forEach((profile, idx) => {
     console.log(`  ${idx + 1}. ${profile.displayName} (${profile.dirName})`);
   });
 
-  console.log(
-    '\nNote: with real Chrome profiles, running many persistent sessions truly in parallel can hit Chrome profile locks. This script will process the selected profiles in batch order for reliability.'
-  );
+  console.log('\nThis script runs profiles one-by-one for reliability with real Chrome profiles.');
+  console.log(`Debug log: ${LOG_FILE}`);
 
   const results = [];
   for (let i = 0; i < selectedProfiles.length; i++) {
@@ -345,9 +575,11 @@ async function main() {
       console.log(`  ❌ ${result.profile.displayName} (${result.profile.dirName}) — ${result.error}`);
     }
   }
+
+  log('=== SCRIPT FINISHED ===');
 }
 
 main().catch((err) => {
-  console.error(err);
+  log('Fatal error:', err);
   process.exit(1);
 });
