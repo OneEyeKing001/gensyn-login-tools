@@ -311,3 +311,4 @@ Initialize login tool framework
 Add OAuth2 authentication flow
 Create session manager
 Add multi-account support
+Fix token refresh race condition
