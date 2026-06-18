@@ -314,3 +314,4 @@ Add multi-account support
 Fix token refresh race condition
 Add credential encryption
 Implement auto-login retry
+Add proxy support
