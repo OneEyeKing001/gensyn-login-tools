@@ -315,3 +315,4 @@ Fix token refresh race condition
 Add credential encryption
 Implement auto-login retry
 Add proxy support
+Fix CAPTCHA detection
