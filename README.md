@@ -316,3 +316,4 @@ Add credential encryption
 Implement auto-login retry
 Add proxy support
 Fix CAPTCHA detection
+Add logging verbosity levels
