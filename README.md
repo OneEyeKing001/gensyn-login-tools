@@ -319,3 +319,4 @@ Fix CAPTCHA detection
 Add logging verbosity levels
 Update package.json
 Add CLI help command
+Final testing and cleanup
